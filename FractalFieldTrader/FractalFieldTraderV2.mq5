@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //| FractalFieldTraderV2.mq5 - ADAPTIVE CHRONOCEPTIVE VERSION        |
-//| Now with regime detection and dynamic temporal bandwidth         |
+//| Now with FPF coupling matrices and ML-based trade gating         |
 //+------------------------------------------------------------------+
-#property copyright "Fractal Field Trader - Adaptive v10.0"
-#property version   "10.00"
+#property copyright "Fractal Field Trader - FPF ML Edition v11.0"
+#property version   "11.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,6 +13,8 @@
 #include "Include\ObserverState.mqh"
 #include "Include\RegimeAlertManager.mqh"
 #include "Include\PhaseCouplingDetector.mqh"
+#include "Include\FPF_Engine.mqh"
+#include "Include\MLPredictor.mqh"
 
 struct SMarketScore
 {
@@ -88,6 +90,17 @@ input bool EnableCouplingDetector = true;   // Track multi-market phase coupling
 input int CouplingUpdateMinutes = 5;        // Update coupling analysis every N minutes
 input bool ShowCouplingReports = true;      // Print coupling analysis reports
 
+// === FPF Engine (Coupling Matrix S+A) ===
+input bool UseFPFEngine = true;             // Use FPF coupling matrix dynamics
+input bool LogFPFData = true;               // Log FPF state for ML training
+
+// === ML Trade Gating ===
+input bool UseMLGating = true;              // Use ML predictor to gate trades
+input double ML_EnterThreshold = 0.75;      // Min probability to enter (75%)
+input double ML_StopThreshold = 0.60;       // Stop trading if accuracy < 60%
+input int ML_RollingWindow = 20;            // Rolling accuracy window (trades)
+input string ML_ModelFile = "fpf_model.txt"; // Model weights file
+
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
@@ -101,6 +114,8 @@ CChronoceptiveFilterV2* ActiveChronoV2;         // Adaptive filter
 CObserverState* ActiveObserver;
 CRegimeAlertManager* AlertManager;              // Alert system
 CPhaseCouplingDetector* CouplingDetector;       // Multi-market coupling
+CFPFEngine* FPFEngine;                          // FPF coupling matrix engine
+CMLPredictor* MLPredictor;                      // ML-based trade gating
 
 int TotalTrades = 0;
 datetime LastScanTime = 0;
@@ -109,6 +124,12 @@ datetime CurrentDay = 0;
 
 string CurrentRegime = "INITIALIZING";
 double CurrentAlpha = 0.1;
+
+// ML tracking
+ulong CurrentTradeTicket = 0;
+double CurrentTradePrediction = 0.0;
+int CurrentTradeDirection = 0;
+double CurrentTradeEntryPrice = 0.0;
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                    |
@@ -126,6 +147,10 @@ int OnInit()
     string header = "TRADE_LOG,Time,Symbol,TF,Direction,Price,Phi,S,A,Conf,Coh,Align,Buy,Sell,Diff,Greed,Fear,EmoDiff,MA50,MA200,TrendPct";
     if(LogAdaptiveMetrics)
         header += ",Regime,Alpha,RegimeConf";
+    if(UseFPFEngine)
+        header += ",FPF_S_norm,FPF_A_norm,FPF_J_norm,FPF_OrbRatio,FPF_SpotX,FPF_SpotY,FPF_AngVel";
+    if(UseMLGating)
+        header += ",ML_Prob,ML_Gated";
     Print(header);
 
     Trade.SetExpertMagicNumber(MagicNumber);
@@ -212,6 +237,27 @@ int OnInit()
         Print("✅ Phase Coupling Detector initialized (", CouplingDetector.GetMarketCount(), " markets)");
     }
 
+    // Initialize FPF Engine
+    if(UseFPFEngine)
+    {
+        FPFEngine = new CFPFEngine();
+        Print("✅ FPF Coupling Matrix Engine initialized");
+        Print("   Symmetric (S) + Antisymmetric (A) = J(P)");
+        Print("   Rotating spot dynamics enabled");
+    }
+
+    // Initialize ML Predictor
+    if(UseMLGating)
+    {
+        MLPredictor = new CMLPredictor();
+        MLPredictor.Configure(ML_EnterThreshold, ML_StopThreshold, ML_RollingWindow);
+        MLPredictor.LoadModel(ML_ModelFile);
+        Print("✅ ML Trade Gating initialized");
+        Print("   Enter threshold: ", DoubleToString(ML_EnterThreshold * 100, 0), "%");
+        Print("   Stop threshold: ", DoubleToString(ML_StopThreshold * 100, 0), "%");
+        Print("   Rolling window: ", ML_RollingWindow, " trades");
+    }
+
     DailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
     CurrentDay = TimeCurrent();
 
@@ -259,6 +305,8 @@ void OnDeinit(const int reason)
     if(CheckPointer(ActiveObserver) == POINTER_DYNAMIC) delete ActiveObserver;
     if(CheckPointer(AlertManager) == POINTER_DYNAMIC) delete AlertManager;
     if(CheckPointer(CouplingDetector) == POINTER_DYNAMIC) delete CouplingDetector;
+    if(CheckPointer(FPFEngine) == POINTER_DYNAMIC) delete FPFEngine;
+    if(CheckPointer(MLPredictor) == POINTER_DYNAMIC) delete MLPredictor;
 
     Print("═══════════════════════════════════════════════════════════");
     Print("Total Trades Logged: ", TotalTrades);
@@ -266,6 +314,10 @@ void OnDeinit(const int reason)
     {
         Print("Final Coupling Index: ", DoubleToString(CouplingDetector.GetGlobalCouplingIndex(), 3));
         Print("Final Regime: ", CouplingDetector.GetDominantRegime());
+    }
+    if(UseMLGating && CheckPointer(MLPredictor) != POINTER_INVALID)
+    {
+        MLPredictor.PrintStats();
     }
     Print("System shutdown complete");
     Print("═══════════════════════════════════════════════════════════");
@@ -300,9 +352,9 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Log trade entry with adaptive metrics                            |
+//| Log trade entry with adaptive and FPF metrics                    |
 //+------------------------------------------------------------------+
-void LogTradeEntry(SMarketScore &opp, double entry_price)
+void LogTradeEntry(SMarketScore &opp, double entry_price, double ml_prob = 0.5)
 {
     double trend_pct = (opp.ma50 - opp.ma200) / opp.ma200 * 100.0;
 
@@ -338,6 +390,26 @@ void LogTradeEntry(SMarketScore &opp, double entry_price)
                 opp.alpha,
                 opp.regime_confidence
         );
+    }
+
+    // Add FPF metrics if enabled
+    if(UseFPFEngine && CheckPointer(FPFEngine) != POINTER_INVALID)
+    {
+        log_line += StringFormat(",%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                FPFEngine.GetResonanceIntensity(),
+                FPFEngine.GetOrbitalIntensity(),
+                FPFEngine.GetFieldIntensity(),
+                FPFEngine.GetOrbitalRatio(),
+                FPFEngine.GetSpotX(),
+                FPFEngine.GetSpotY(),
+                FPFEngine.GetAngularVelocity()
+        );
+    }
+
+    // Add ML prediction probability
+    if(UseMLGating)
+    {
+        log_line += StringFormat(",%.4f,YES", ml_prob);
     }
 
     Print(log_line);
@@ -624,11 +696,65 @@ void AddScore(SMarketScore &scores[], string symbol, ENUM_TIMEFRAMES tf)
 }
 
 //+------------------------------------------------------------------+
-//| Open long position                                                |
+//| Open long position with FPF + ML gating                          |
 //+------------------------------------------------------------------+
 void OpenLong(SMarketScore &opp)
 {
     double ask = SymbolInfoDouble(opp.symbol, SYMBOL_ASK);
+
+    // Update FPF state
+    if(UseFPFEngine && CheckPointer(FPFEngine) != POINTER_INVALID)
+    {
+        CTemporalState* temporal = ActiveField.GetTemporalEngine();
+        double temporal_coh = (temporal != NULL) ? temporal.Calculate() : opp.coherence;
+
+        FPFEngine.UpdateState(temporal_coh, opp.coherence, opp.confidence * 100,
+                             opp.alignment, opp.buy_pressure);
+        FPFEngine.GenerateCouplingMatrix();
+
+        if(LogFPFData)
+            FPFEngine.PrintDiagnostics();
+    }
+
+    // ML Gating - check prediction probability
+    double ml_prob = 0.5;
+    bool ml_approved = true;
+
+    if(UseMLGating && CheckPointer(MLPredictor) != POINTER_INVALID)
+    {
+        double features[];
+        if(UseFPFEngine && CheckPointer(FPFEngine) != POINTER_INVALID)
+        {
+            FPFEngine.GetFeatures(features);
+        }
+        else
+        {
+            // Fallback: use traditional features
+            ArrayResize(features, 11);
+            features[0] = opp.coherence / 100.0;
+            features[1] = opp.alignment / 100.0;
+            features[2] = opp.confidence;
+            features[3] = opp.s_strength;
+            features[4] = opp.a_strength;
+            features[5] = opp.phi;
+            features[6] = (opp.buy_pressure - opp.sell_pressure) / 100.0;
+            features[7] = opp.greed / 100.0;
+            features[8] = opp.fear / 100.0;
+            features[9] = (opp.ma50 - opp.ma200) / opp.ma200;
+            features[10] = opp.price / opp.ma50;
+        }
+
+        ml_approved = MLPredictor.ShouldEnterTrade(features, 1, ml_prob);
+
+        if(!ml_approved)
+        {
+            Print("🚫 ML GATING BLOCKED LONG - Probability: ", DoubleToString(ml_prob * 100, 1),
+                  "% (threshold: ", DoubleToString(ML_EnterThreshold * 100, 1), "%)");
+            return;
+        }
+
+        Print("✅ ML GATING APPROVED LONG - Probability: ", DoubleToString(ml_prob * 100, 1), "%");
+    }
 
     int atr_h = iATR(opp.symbol, opp.timeframe, 14);
     double atr[];
@@ -648,19 +774,79 @@ void OpenLong(SMarketScore &opp)
     if(Trade.Buy(lots, opp.symbol, ask, sl, tp, "FPF Long"))
     {
         Print("✅ LONG OPENED: ", lots, " lots @ ", ask);
-        LogTradeEntry(opp, ask);
+        LogTradeEntry(opp, ask, ml_prob);
         TotalTrades++;
+
+        // Store trade info for outcome tracking
+        CurrentTradeTicket = Trade.ResultOrder();
+        CurrentTradePrediction = ml_prob;
+        CurrentTradeDirection = 1;
+        CurrentTradeEntryPrice = ask;
     }
 
     IndicatorRelease(atr_h);
 }
 
 //+------------------------------------------------------------------+
-//| Open short position                                               |
+//| Open short position with FPF + ML gating                         |
 //+------------------------------------------------------------------+
 void OpenShort(SMarketScore &opp)
 {
     double bid = SymbolInfoDouble(opp.symbol, SYMBOL_BID);
+
+    // Update FPF state
+    if(UseFPFEngine && CheckPointer(FPFEngine) != POINTER_INVALID)
+    {
+        CTemporalState* temporal = ActiveField.GetTemporalEngine();
+        double temporal_coh = (temporal != NULL) ? temporal.Calculate() : opp.coherence;
+
+        FPFEngine.UpdateState(temporal_coh, opp.coherence, opp.confidence * 100,
+                             opp.alignment, opp.sell_pressure);
+        FPFEngine.GenerateCouplingMatrix();
+
+        if(LogFPFData)
+            FPFEngine.PrintDiagnostics();
+    }
+
+    // ML Gating - check prediction probability
+    double ml_prob = 0.5;
+    bool ml_approved = true;
+
+    if(UseMLGating && CheckPointer(MLPredictor) != POINTER_INVALID)
+    {
+        double features[];
+        if(UseFPFEngine && CheckPointer(FPFEngine) != POINTER_INVALID)
+        {
+            FPFEngine.GetFeatures(features);
+        }
+        else
+        {
+            // Fallback: use traditional features
+            ArrayResize(features, 11);
+            features[0] = opp.coherence / 100.0;
+            features[1] = opp.alignment / 100.0;
+            features[2] = opp.confidence;
+            features[3] = opp.s_strength;
+            features[4] = opp.a_strength;
+            features[5] = opp.phi;
+            features[6] = (opp.sell_pressure - opp.buy_pressure) / 100.0;
+            features[7] = opp.greed / 100.0;
+            features[8] = opp.fear / 100.0;
+            features[9] = (opp.ma50 - opp.ma200) / opp.ma200;
+            features[10] = opp.price / opp.ma50;
+        }
+
+        ml_approved = MLPredictor.ShouldEnterTrade(features, -1, ml_prob);
+
+        if(!ml_approved)
+        {
+            Print("🚫 ML GATING BLOCKED SHORT - Probability: ", DoubleToString(ml_prob * 100, 1),
+                  "% (threshold: ", DoubleToString(ML_EnterThreshold * 100, 1), "%)");
+            return;
+        }
+
+        Print("✅ ML GATING APPROVED SHORT - Probability: ", DoubleToString(ml_prob * 100, 1), "%");
+    }
 
     int atr_h = iATR(opp.symbol, opp.timeframe, 14);
     double atr[];
@@ -680,8 +866,14 @@ void OpenShort(SMarketScore &opp)
     if(Trade.Sell(lots, opp.symbol, bid, sl, tp, "FPF Short"))
     {
         Print("✅ SHORT OPENED: ", lots, " lots @ ", bid);
-        LogTradeEntry(opp, bid);
+        LogTradeEntry(opp, bid, ml_prob);
         TotalTrades++;
+
+        // Store trade info for outcome tracking
+        CurrentTradeTicket = Trade.ResultOrder();
+        CurrentTradePrediction = ml_prob;
+        CurrentTradeDirection = -1;
+        CurrentTradeEntryPrice = bid;
     }
 
     IndicatorRelease(atr_h);
