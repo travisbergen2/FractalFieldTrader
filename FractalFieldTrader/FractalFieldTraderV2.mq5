@@ -64,8 +64,8 @@ input bool Scan_H4 = true;
 input int ScanIntervalMinutes = 15;
 
 // === Field Thresholds ===
-input double InputCoherence = 55.0;     // Minimum overall coherence
-input double InputAlignment = 53.0;     // Minimum field alignment
+input double InputCoherence = 45.0;     // Minimum overall coherence (sweet spot: 35-55)
+input double InputAlignment = 42.0;     // Minimum field alignment (sweet spot: 35-55)
 
 // === Adaptive Filter ===
 input bool UseAdaptiveFilter = true;   // Use adaptive chronoceptive filter (V2)
@@ -548,8 +548,8 @@ void AddScore(SMarketScore &scores[], string symbol, ENUM_TIMEFRAMES tf)
         regime_conf = 1.0;
     }
 
-    // Check minimums
-    if(s_strength < 0.12 || confidence < 0.40) return;
+    // Check minimums - STRICTER to reduce small losses
+    if(s_strength < 0.18 || confidence < 0.52) return;
 
     double phi = (s_strength * confidence) + (a_strength * confidence * 0.3);
 
@@ -597,8 +597,9 @@ void AddScore(SMarketScore &scores[], string symbol, ENUM_TIMEFRAMES tf)
     sc.alpha = alpha;
     sc.regime_confidence = regime_conf;
 
-    // Check direction
-    if(buy > sell + 10 && !strong_down && greed > 50 && fear < 50)
+    // Check direction - STRICTER CONDITIONS to reduce small losses
+    // Require larger pressure differential (20 instead of 10) and stronger emotional signals
+    if(buy > sell + 20 && !strong_down && greed > 55 && fear < 45 && (greed - fear) > 15)
     {
         sc.direction = 1;  // LONG
         sc.score = phi * confidence * (buy - sell) / 100.0;
@@ -609,7 +610,7 @@ void AddScore(SMarketScore &scores[], string symbol, ENUM_TIMEFRAMES tf)
 
         Print("  ✅ ", symbol, " ", EnumToString(tf), " LONG: ", DoubleToString(sc.score, 2));
     }
-    else if(sell > buy + 10 && !strong_up && fear > 40 && fear < 80)
+    else if(sell > buy + 20 && !strong_up && fear > 50 && fear < 75 && greed < 45 && (fear - greed) > 10)
     {
         sc.direction = -1;  // SHORT
         sc.score = phi * confidence * (sell - buy) / 100.0;
